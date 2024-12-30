@@ -111,6 +111,18 @@ import { parseString as parseSetCookieString } from 'set-cookie-parser';
                     in: 'header',
                     schema: { type: 'string' }
                 },
+                'X-Remove-Images-From-Markdown': {
+                    description: `Remove all images from the markdown output.\n\n` +
+                        'Example: `X-Remove-Images-From-Markdown: true`',
+                    in: 'header',
+                    schema: { type: 'string' }
+                },
+                'X-Remove-Links-From-Markdown': {
+                    description: `Remove all links from the markdown output (keeping the text).\n\n` +
+                        'Example: `X-Remove-Links-From-Markdown: true`',
+                    in: 'header',
+                    schema: { type: 'string' }
+                },
             }
         }
     }
@@ -187,6 +199,16 @@ export class CrawlerOptions extends AutoCastable implements AutoCastableMetaClas
         nullable: true,
     })
     timeout?: number | null;
+
+    @Prop({
+        default: true,
+    })
+    removeImagesFromMarkdown!: boolean;
+
+    @Prop({
+        default: true,
+    })
+    removeLinksFromMarkdown!: boolean;
 
     static override from<T extends CrawlerOptions>(this: Constructor<T>, input: any, ...args: any[]): T {
         const instance = super.from(input, ...args) as T;
@@ -288,6 +310,16 @@ export class CrawlerOptions extends AutoCastable implements AutoCastableMetaClas
 
             if (instance.cacheTolerance) {
                 instance.cacheTolerance = instance.cacheTolerance * 1000;
+            }
+
+            const removeImagesFromMarkdown = getHeader('x-remove-images-from-markdown');
+            if (removeImagesFromMarkdown !== undefined) {
+                instance.removeImagesFromMarkdown = Boolean(removeImagesFromMarkdown);
+            }
+
+            const removeLinksFromMarkdown = getHeader('x-remove-links-from-markdown');
+            if (removeLinksFromMarkdown !== undefined) {
+                instance.removeLinksFromMarkdown = Boolean(removeLinksFromMarkdown);
             }
         }
 

@@ -12,10 +12,11 @@ import { Request, Response } from 'express';
 const pNormalizeUrl = import("@esm2cjs/normalize-url");
 // import { AltTextService } from '../services/alt-text';
 import TurndownService from 'turndown';
+import { gfm } from 'turndown-plugin-gfm';
 // import { Crawled } from '../db/crawled';
 import { cleanAttribute } from '../utils/misc';
 import { randomUUID } from 'crypto';
-
+import { tidyMarkdown } from '../utils/markdown';
 
 import { CrawlerOptions, CrawlerOptionsHeaderOnly } from '../dto/scrapping-options';
 // import { PDFExtractor } from '../services/pdf-extract';
@@ -89,7 +90,9 @@ const indexProto = {
 export class CrawlerHost extends RPCHost {
     logger = new Logger('Crawler');
 
-    turnDownPlugins = [require('turndown-plugin-gfm').tables];
+    turnDownPlugins = [
+        require('turndown-plugin-gfm').tables
+    ];
 
     cacheRetentionMs = 1000 * 3600 * 24 * 7;
     cacheValidMs = 1000 * 3600;
@@ -177,9 +180,18 @@ export class CrawlerHost extends RPCHost {
         const turnDownService = new TurndownService({
             codeBlockStyle: 'fenced',
             preformattedCode: true,
+            headingStyle: 'atx'
         } as any);
         if (!options?.noRules) {
             console.log('Adding Turndown rules');
+            turnDownService.addRule('headings', {
+                filter: ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'],
+                replacement: function (content, node: any) {
+                    const level = Number(node.nodeName.charAt(1));
+                    const hashes = '#'.repeat(level);
+                    return `\n\n${hashes} ${content}\n\n`;
+                }
+            });
             turnDownService.addRule('remove-irrelevant', {
                 filter: ['meta', 'style', 'script', 'noscript', 'link', 'textarea', 'select'],
                 replacement: () => ''
@@ -327,7 +339,12 @@ export class CrawlerHost extends RPCHost {
         screenshotUrl?: string;
         pageshotUrl?: string;
     }, nominalUrl?: URL) {
-        console.log('Formatting snapshot', { mode, url: nominalUrl?.toString() });
+        console.log('Formatting snapshot', {
+            mode,
+            url: nominalUrl?.toString(),
+            removeImages: this.threadLocal.get('removeImagesFromMarkdown'),
+            removeLinks: this.threadLocal.get('removeLinksFromMarkdown')
+        });
         if (mode === 'screenshot') {
             if (snapshot.screenshot && !snapshot.screenshotUrl) {
                 console.log('Saving screenshot');
@@ -550,10 +567,16 @@ export class CrawlerHost extends RPCHost {
 
         const cleanText = (contentText || '').trim();
 
+        // Add tidyMarkdown with options here
+        const finalContent = tidyMarkdown(cleanText, {
+            removeImages: Boolean(this.threadLocal.get('removeImagesFromMarkdown')),
+            removeLinks: Boolean(this.threadLocal.get('removeLinksFromMarkdown'))
+        });
+
         const formatted: FormattedPage = {
             title: (snapshot.parsed?.title || snapshot.title || '').trim(),
             url: nominalUrl?.toString() || snapshot.href?.trim(),
-            content: cleanText,
+            content: finalContent,  // Use the processed content
             publishedTime: snapshot.parsed?.publishedTime || undefined,
 
             toString() {
@@ -627,6 +650,11 @@ ${suffixMixins.length ? `\n${suffixMixins.join('\n\n')}\n` : ''}`;
         const noSlashURL = ctx.req.url.slice(1);
         const crawlerOptions = ctx.req.method === 'GET' ? crawlerOptionsHeaderOnly : crawlerOptionsParamsAllowed;
         console.log('Crawler options:', crawlerOptions);
+
+        // Set the options in thread local
+        this.threadLocal.set('removeImagesFromMarkdown', crawlerOptions.removeImagesFromMarkdown);
+        this.threadLocal.set('removeLinksFromMarkdown', crawlerOptions.removeLinksFromMarkdown);
+
         if (!noSlashURL && !crawlerOptions.url) {
             console.log('No URL provided, returning index');
             if (!ctx.req.accepts('text/plain') && (ctx.req.accepts('text/json') || ctx.req.accepts('application/json'))) {
@@ -936,5 +964,19 @@ ${suffixMixins.length ? `\n${suffixMixins.join('\n\n')}\n` : ''}`;
         }
 
         return this.formatSnapshot(mode, lastSnapshot, url);
+    }
+
+    configureTurndown() {
+        const turnDownService = new TurndownService({
+            headingStyle: 'atx',
+            codeBlockStyle: 'fenced'
+        });
+
+        // Use the gfm plugin properly
+        turnDownService.use(gfm);  // This enables all GFM features including tables
+
+        // ... rest of turndown configuration ...
+
+        return turnDownService;
     }
 }
