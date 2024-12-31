@@ -1,39 +1,47 @@
+# Use Node.js 18 slim image (Debian-based)
 FROM node:18-slim
 
-# Install Chrome dependencies
+# Install necessary tools and libraries
 RUN apt-get update && apt-get install -y \
     chromium \
-    fonts-ipafont-gothic \
-    fonts-wqy-zenhei \
-    fonts-thai-tlwg \
-    fonts-kacst \
-    fonts-freefont-ttf \
-    curl \
-    --no-install-recommends \
+    libmagic-dev \
+    build-essential \
+    python3 \
+    wget \
+    gnupg \
+    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list' \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
 
+# Set environment variables
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+
+# Set working directory
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+# Copy package.json and package-lock.json
+COPY backend/functions/package*.json ./
 
 # Install dependencies
-RUN npm install
+RUN npm ci
 
-# Copy source
-COPY . .
+# Copy the rest of the application code
+COPY backend/functions .
 
-# Build
+# Build the application
 RUN npm run build
 
-# Environment variables
-ENV NODE_ENV=production
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV CHROME_PATH=/usr/bin/chromium
-ENV CHROME_FLAGS="--no-sandbox --disable-dev-shm-usage --disable-gpu"
+# Create local storage directory and set permissions
+RUN mkdir -p /app/local-storage && chmod 777 /app/local-storage
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s \
-  CMD curl -f http://localhost:${PORT}/health || exit 1
+# Set the port the app runs on
+ENV PORT=8072
 
-CMD [ "npm", "start" ]
+# Expose the port the app runs on
+EXPOSE 8072
+
+# Start the application
+CMD ["node", "build/server.js"]

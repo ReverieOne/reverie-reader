@@ -254,8 +254,17 @@ export class PuppeteerControl extends AsyncService {
             } else {
                 this.browser.process()?.kill('SIGKILL');
             }
+
         }
+
+        const args = [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--single-process'
+        ];
         this.browser = await puppeteer.launch({
+            args:args,
             timeout: 10_000
         }).catch((err: any) => {
             this.logger.error(`Unknown firebase issue, just die fast.`, { err });
