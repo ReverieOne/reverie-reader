@@ -3,6 +3,7 @@ import fs from 'fs';
 import { container, singleton } from 'tsyringe';
 import { AsyncService, Defer, marshalErrorLike, AssertionFailureError, delay, maxConcurrency } from 'civkit';
 import { Logger } from '../shared/index';
+import { TimingService } from './timing';
 
 import type { Browser, CookieParam, Page } from 'puppeteer';
 import puppeteer from 'puppeteer-extra';
@@ -212,7 +213,9 @@ function giveSnapshot(stopActiveSnapshot) {
 export class PuppeteerControl extends AsyncService {
 
     _sn = 0;
-    browser!: Browser;
+    private activeBrowser: Browser | null = null;
+    private isInitializing = false;
+    private initPromise: Promise<void> | null = null;
     logger = new Logger('CHANGE_LOGGER_NAME')
 
     private __healthCheckInterval?: NodeJS.Timeout;
@@ -227,6 +230,7 @@ export class PuppeteerControl extends AsyncService {
     circuitBreakerHosts: Set<string> = new Set();
 
     constructor(
+        private timingService: TimingService,
     ) {
         super(...arguments);
         this.setMaxListeners(2 * Math.floor(os.totalmem() / (256 * 1024 * 1024)) + 1); 148 - 95;
@@ -237,8 +241,72 @@ export class PuppeteerControl extends AsyncService {
         });
     }
 
-    briefPages() {
-        this.logger.info(`Status: ${this.livePages.size} pages alive: ${Array.from(this.livePages).map((x) => this.snMap.get(x)).sort().join(', ')}; ${this.__loadedPage.length} idle pages: ${this.__loadedPage.map((x) => this.snMap.get(x)).sort().join(', ')}`);
+    private async getOrCreateBrowser(): Promise<Browser> {
+        if (this.activeBrowser?.connected) {
+            return this.activeBrowser;
+        }
+
+        if (!this.initPromise) {
+            this.initPromise = this.initBrowser();
+        }
+        await this.initPromise;
+
+        if (!this.activeBrowser?.connected) {
+            throw new Error('Browser initialization failed');
+        }
+
+        return this.activeBrowser;
+    }
+
+    private async initBrowser(): Promise<void> {
+        if (this.isInitializing) {
+            return;
+        }
+
+        this.isInitializing = true;
+        try {
+            if (this.activeBrowser) {
+                try {
+                    if (this.activeBrowser.connected) {
+                        await this.activeBrowser.close();
+                    } else {
+                        this.activeBrowser.process()?.kill('SIGKILL');
+                    }
+                } catch (err: any) {
+                    this.logger.warn('Error cleaning up old browser', { err: marshalErrorLike(err) });
+                }
+            }
+
+            const args = [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+            ];
+
+            this.activeBrowser = await puppeteer.launch({
+                args: args,
+                timeout: 10_000
+            }).catch((err: any) => {
+                this.logger.error(`Browser launch failed`, { err });
+                process.nextTick(() => {
+                    this.emit('error', err);
+                });
+                return Promise.reject(err);
+            });
+
+            if (this.activeBrowser) {
+                this.activeBrowser.once('disconnected', () => {
+                    this.logger.warn(`Browser disconnected`);
+                    this.activeBrowser = null;
+                    this.initPromise = null;
+                    this.emit('crippled');
+                    process.nextTick(() => this.serviceReady());
+                });
+
+                this.logger.info(`Browser launched: ${this.activeBrowser.process()?.pid}`);
+            }
+        } finally {
+            this.isInitializing = false;
+        }
     }
 
     override async init() {
@@ -248,36 +316,7 @@ export class PuppeteerControl extends AsyncService {
         }
         await this.dependencyReady();
 
-        if (this.browser) {
-            if (this.browser.connected) {
-                await this.browser.close();
-            } else {
-                this.browser.process()?.kill('SIGKILL');
-            }
-
-        }
-
-        const args = [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-        ];
-        this.browser = await puppeteer.launch({
-            args:args,
-            timeout: 10_000
-        }).catch((err: any) => {
-            this.logger.error(`Unknown firebase issue, just die fast.`, { err });
-            process.nextTick(() => {
-                this.emit('error', err);
-                // process.exit(1);
-            });
-            return Promise.reject(err);
-        });
-        this.browser.once('disconnected', () => {
-            this.logger.warn(`Browser disconnected`);
-            this.emit('crippled');
-            process.nextTick(() => this.serviceReady());
-        });
-        this.logger.info(`Browser launched: ${this.browser.process()?.pid}`);
+        await this.getOrCreateBrowser();
 
         this.emit('ready');
 
@@ -287,37 +326,31 @@ export class PuppeteerControl extends AsyncService {
 
     @maxConcurrency(1)
     async healthCheck() {
-        if (Date.now() - this.lastPageCratedAt <= 10_000) {
-            this.briefPages();
-            return;
-        }
-        const healthyPage = await this.newPage().catch((err) => {
-            this.logger.warn(`Health check failed`, { err: marshalErrorLike(err) });
-            return null;
-        });
+        try {
+            const browser = await this.getOrCreateBrowser();
+            if (!browser.connected) {
+                throw new Error('Browser disconnected');
+            }
 
-        if (healthyPage) {
-            this.__loadedPage.push(healthyPage);
-
-            if (this.__loadedPage.length > 3) {
-                this.ditchPage(this.__loadedPage.shift()!);
+            if (this.__loadedPage.length < 2) {
+                const healthyPage = await this.newPage();
+                if (healthyPage) {
+                    this.__loadedPage.push(healthyPage);
+                }
             }
 
             this.briefPages();
-
-            return;
+        } catch (err: any) {
+            this.logger.warn(`Health check failed`, { err: marshalErrorLike(err) });
+            this.initPromise = null; // Allow retry on next request
         }
-
-        this.logger.warn(`Trying to clean up...`);
-        this.browser.process()?.kill('SIGKILL');
-        Reflect.deleteProperty(this, 'browser');
-        this.emit('crippled');
-        this.logger.warn(`Browser killed`);
     }
 
     async newPage() {
         await this.serviceReady();
-        const dedicatedContext = await this.browser.createBrowserContext();
+        const browser = await this.getOrCreateBrowser();
+
+        const dedicatedContext = await browser.createBrowserContext();
         const sn = this._sn++;
         const page = await dedicatedContext.newPage();
         const preparations: any[] = [];
@@ -479,124 +512,163 @@ document.addEventListener('load', handlePageLoad);
     }
 
     async *scrap(parsedUrl: URL, options?: ScrappingOptions): AsyncGenerator<PageSnapshot | undefined> {
-        // parsedUrl.search = '';
-        console.log('Scraping options:', options);
-        const url = parsedUrl.toString();
+        this.timingService.startTiming('puppeteerScrap');
+        try {
+            // parsedUrl.search = '';
+            console.log('Scraping options:', options);
+            const url = parsedUrl.toString();
 
-        let snapshot: PageSnapshot | undefined;
-        let screenshot: Buffer | undefined;
-        let pageshot: Buffer | undefined;
-        const page = await this.getNextPage();
-        const sn = this.snMap.get(page);
-        this.logger.info(`Page ${sn}: Scraping ${url}`, { url });
+            let snapshot: PageSnapshot | undefined;
+            let screenshot: Buffer | undefined;
+            let pageshot: Buffer | undefined;
+            const page = await this.getNextPage();
+            const sn = this.snMap.get(page);
+            this.logger.info(`Page ${sn}: Scraping ${url}`, { url });
 
-        if (options?.proxyUrl) {
-            this.logger.info(`Page ${sn}: Using proxy:`, options.proxyUrl);
-            await page.useProxy(options.proxyUrl);
-        }
-
-        if (options?.cookies) {
-            this.logger.info(`Page ${sn}: Attempting to set cookies:`, JSON.stringify(options.cookies, null, 2));
-            try {
-                options.cookies.forEach(validateCookie);
-                await page.setCookie(...options.cookies);
-            } catch (error) {
-                this.logger.error(`Page ${sn}: Error setting cookies:`, error);
-                this.logger.info(`Page ${sn}: Problematic cookies:`, JSON.stringify(options.cookies, null, 2));
-                throw error;
+            if (options?.proxyUrl) {
+                this.logger.info(`Page ${sn}: Using proxy:`, options.proxyUrl);
+                await page.useProxy(options.proxyUrl);
             }
-        }
 
-        if (options?.overrideUserAgent) {
-            await page.setUserAgent(options.overrideUserAgent);
-        }
+            if (options?.cookies) {
+                this.logger.info(`Page ${sn}: Attempting to set cookies:`, JSON.stringify(options.cookies, null, 2));
+                try {
+                    options.cookies.forEach(validateCookie);
+                    await page.setCookie(...options.cookies);
+                } catch (error) {
+                    this.logger.error(`Page ${sn}: Error setting cookies:`, error);
+                    this.logger.info(`Page ${sn}: Problematic cookies:`, JSON.stringify(options.cookies, null, 2));
+                    throw error;
+                }
+            }
 
-        let nextSnapshotDeferred = Defer();
-        const crippleListener = () => nextSnapshotDeferred.reject(new ServiceCrashedError({ message: `Browser crashed, try again` }));
-        this.once('crippled', crippleListener);
-        nextSnapshotDeferred.promise.finally(() => {
-            this.off('crippled', crippleListener);
-        });
-        let finalized = false;
-        const hdl = (s: any) => {
-            if (snapshot === s) {
-                return;
+            if (options?.overrideUserAgent) {
+                await page.setUserAgent(options.overrideUserAgent);
             }
-            snapshot = s;
-            if (s?.maxElemDepth && s.maxElemDepth > 256) {
-                return;
-            }
-            if (s?.elemCount && s.elemCount > 10_000) {
-                return;
-            }
-            nextSnapshotDeferred.resolve(s);
-            nextSnapshotDeferred = Defer();
+
+            let nextSnapshotDeferred = Defer();
+            const crippleListener = () => nextSnapshotDeferred.reject(new ServiceCrashedError({ message: `Browser crashed, try again` }));
             this.once('crippled', crippleListener);
             nextSnapshotDeferred.promise.finally(() => {
                 this.off('crippled', crippleListener);
             });
-        };
-        page.on('snapshot', hdl);
-        page.once('abuse', (event: any) => {
-            this.emit('abuse', { ...event, url: parsedUrl });
-            nextSnapshotDeferred.reject(
-                new SecurityCompromiseError(`Abuse detected: ${event.reason}`)
-            );
-        });
+            let finalized = false;
+            const hdl = (s: any) => {
+                if (snapshot === s) {
+                    return;
+                }
+                snapshot = s;
+                if (s?.maxElemDepth && s.maxElemDepth > 256) {
+                    return;
+                }
+                if (s?.elemCount && s.elemCount > 10_000) {
+                    return;
+                }
+                nextSnapshotDeferred.resolve(s);
+                nextSnapshotDeferred = Defer();
+                this.once('crippled', crippleListener);
+                nextSnapshotDeferred.promise.finally(() => {
+                    this.off('crippled', crippleListener);
+                });
+            };
+            page.on('snapshot', hdl);
+            page.once('abuse', (event: any) => {
+                this.emit('abuse', { ...event, url: parsedUrl });
+                nextSnapshotDeferred.reject(
+                    new SecurityCompromiseError(`Abuse detected: ${event.reason}`)
+                );
+            });
 
-        const timeout = options?.timeoutMs || 30_000;
+            const timeout = options?.timeoutMs || 30_000;
 
-        const gotoPromise = page.goto(url, {
-            waitUntil: ['load', 'domcontentloaded', 'networkidle0'],
-            timeout,
-        })
-            .catch((err) => {
-                if (err instanceof TimeoutError) {
-                    this.logger.warn(`Page ${sn}: Browsing of ${url} timed out`, { err: marshalErrorLike(err) });
-                    return new AssertionFailureError({
+            const gotoPromise = page.goto(url, {
+                waitUntil: ['load', 'domcontentloaded', 'networkidle0'],
+                timeout,
+            })
+                .catch((err) => {
+                    if (err instanceof TimeoutError) {
+                        this.logger.warn(`Page ${sn}: Browsing of ${url} timed out`, { err: marshalErrorLike(err) });
+                        return new AssertionFailureError({
+                            message: `Failed to goto ${url}: ${err}`,
+                            cause: err,
+                        });
+                    }
+
+                    this.logger.warn(`Page ${sn}: Browsing of ${url} failed`, { err: marshalErrorLike(err) });
+                    return Promise.reject(new AssertionFailureError({
                         message: `Failed to goto ${url}: ${err}`,
                         cause: err,
-                    });
-                }
+                    }));
+                }).then(async (stuff) => {
+                    // This check is necessary because without snapshot, the condition of the page is unclear
+                    // Calling evaluate directly may stall the process.
+                    if (!snapshot) {
+                        if (stuff instanceof Error) {
+                            finalized = true;
+                            throw stuff;
+                        }
+                    }
+                    try {
+                        const pSubFrameSnapshots = this.snapshotChildFrames(page);
+                        snapshot = await page.evaluate('giveSnapshot(true)') as PageSnapshot;
+                        screenshot = await page.screenshot();
+                        if (snapshot) {
+                            snapshot.childFrames = await pSubFrameSnapshots;
+                        }
+                    } catch (err: any) {
+                        this.logger.warn(`Page ${sn}: Failed to finalize ${url}`, { err: marshalErrorLike(err) });
+                        if (stuff instanceof Error) {
+                            finalized = true;
+                            throw stuff;
+                        }
+                    }
+                    if (!snapshot?.html) {
+                        if (stuff instanceof Error) {
+                            finalized = true;
+                            throw stuff;
+                        }
+                    }
+                    try {
+                        if ((!snapshot?.title || !snapshot?.parsed?.content) && !(snapshot?.pdfs?.length)) {
+                            const salvaged = await this.salvage(url, page);
+                            if (salvaged) {
+                                const pSubFrameSnapshots = this.snapshotChildFrames(page);
+                                snapshot = await page.evaluate('giveSnapshot(true)') as PageSnapshot;
+                                screenshot = await page.screenshot();
+                                pageshot = await page.screenshot({ fullPage: true });
+                                if (snapshot) {
+                                    snapshot.childFrames = await pSubFrameSnapshots;
+                                }
+                            }
+                        }
+                    } catch (err: any) {
+                        this.logger.warn(`Page ${sn}: Failed to salvage ${url}`, { err: marshalErrorLike(err) });
+                    }
 
-                this.logger.warn(`Page ${sn}: Browsing of ${url} failed`, { err: marshalErrorLike(err) });
-                return Promise.reject(new AssertionFailureError({
-                    message: `Failed to goto ${url}: ${err}`,
-                    cause: err,
-                }));
-            }).then(async (stuff) => {
-                // This check is necessary because without snapshot, the condition of the page is unclear
-                // Calling evaluate directly may stall the process.
-                if (!snapshot) {
-                    if (stuff instanceof Error) {
-                        finalized = true;
-                        throw stuff;
+                    finalized = true;
+                    if (snapshot?.html) {
+                        this.logger.info(`Page ${sn}: Snapshot of ${url} done`, { url, title: snapshot?.title, href: snapshot?.href });
+                        this.emit(
+                            'crawled',
+                            { ...snapshot, screenshot, pageshot },
+                            { ...options, url: parsedUrl }
+                        );
                     }
-                }
-                try {
-                    const pSubFrameSnapshots = this.snapshotChildFrames(page);
-                    snapshot = await page.evaluate('giveSnapshot(true)') as PageSnapshot;
-                    screenshot = await page.screenshot();
-                    if (snapshot) {
-                        snapshot.childFrames = await pSubFrameSnapshots;
-                    }
-                } catch (err: any) {
-                    this.logger.warn(`Page ${sn}: Failed to finalize ${url}`, { err: marshalErrorLike(err) });
-                    if (stuff instanceof Error) {
-                        finalized = true;
-                        throw stuff;
-                    }
-                }
-                if (!snapshot?.html) {
-                    if (stuff instanceof Error) {
-                        finalized = true;
-                        throw stuff;
-                    }
-                }
-                try {
-                    if ((!snapshot?.title || !snapshot?.parsed?.content) && !(snapshot?.pdfs?.length)) {
-                        const salvaged = await this.salvage(url, page);
-                        if (salvaged) {
+                });
+
+            let waitForPromise: Promise<any> | undefined;
+            if (options?.waitForSelector) {
+                console.log('Waiting for selector', options.waitForSelector);
+                const t0 = Date.now();
+                waitForPromise = nextSnapshotDeferred.promise.then(() => {
+                    const t1 = Date.now();
+                    const elapsed = t1 - t0;
+                    const remaining = timeout - elapsed;
+                    const thisTimeout = remaining > 100 ? remaining : 100;
+                    const p = (Array.isArray(options.waitForSelector) ?
+                        Promise.all(options.waitForSelector.map((x) => page.waitForSelector(x, { timeout: thisTimeout }))) :
+                        page.waitForSelector(options.waitForSelector!, { timeout: thisTimeout }))
+                        .then(async () => {
                             const pSubFrameSnapshots = this.snapshotChildFrames(page);
                             snapshot = await page.evaluate('giveSnapshot(true)') as PageSnapshot;
                             screenshot = await page.screenshot();
@@ -604,93 +676,59 @@ document.addEventListener('load', handlePageLoad);
                             if (snapshot) {
                                 snapshot.childFrames = await pSubFrameSnapshots;
                             }
-                        }
+                            finalized = true;
+                        })
+                        .catch((err) => {
+                            this.logger.warn(`Page ${sn}: Failed to wait for selector ${options.waitForSelector}`, { err: marshalErrorLike(err) });
+                            waitForPromise = undefined;
+                        });
+                    return p as any;
+                });
+            }
+
+            try {
+                let lastHTML = snapshot?.html;
+                while (true) {
+                    const ckpt = [nextSnapshotDeferred.promise, gotoPromise];
+                    if (waitForPromise) {
+                        ckpt.push(waitForPromise);
                     }
-                } catch (err: any) {
-                    this.logger.warn(`Page ${sn}: Failed to salvage ${url}`, { err: marshalErrorLike(err) });
-                }
-
-                finalized = true;
-                if (snapshot?.html) {
-                    this.logger.info(`Page ${sn}: Snapshot of ${url} done`, { url, title: snapshot?.title, href: snapshot?.href });
-                    this.emit(
-                        'crawled',
-                        { ...snapshot, screenshot, pageshot },
-                        { ...options, url: parsedUrl }
-                    );
-                }
-            });
-
-        let waitForPromise: Promise<any> | undefined;
-        if (options?.waitForSelector) {
-            console.log('Waiting for selector', options.waitForSelector);
-            const t0 = Date.now();
-            waitForPromise = nextSnapshotDeferred.promise.then(() => {
-                const t1 = Date.now();
-                const elapsed = t1 - t0;
-                const remaining = timeout - elapsed;
-                const thisTimeout = remaining > 100 ? remaining : 100;
-                const p = (Array.isArray(options.waitForSelector) ?
-                    Promise.all(options.waitForSelector.map((x) => page.waitForSelector(x, { timeout: thisTimeout }))) :
-                    page.waitForSelector(options.waitForSelector!, { timeout: thisTimeout }))
-                    .then(async () => {
-                        const pSubFrameSnapshots = this.snapshotChildFrames(page);
-                        snapshot = await page.evaluate('giveSnapshot(true)') as PageSnapshot;
+                    if (options?.minIntervalMs) {
+                        ckpt.push(delay(options.minIntervalMs));
+                    }
+                    let error;
+                    await Promise.race(ckpt).catch((err) => error = err);
+                    if (finalized && !error) {
+                        if (!snapshot && !screenshot) {
+                            if (error) {
+                                throw error;
+                            }
+                            throw new AssertionFailureError(`Could not extract any meaningful content from the page`);
+                        }
+                        yield { ...snapshot, screenshot, pageshot } as PageSnapshot;
+                        break;
+                    }
+                    if (options?.favorScreenshot && snapshot?.title && snapshot?.html !== lastHTML) {
                         screenshot = await page.screenshot();
                         pageshot = await page.screenshot({ fullPage: true });
-                        if (snapshot) {
-                            snapshot.childFrames = await pSubFrameSnapshots;
-                        }
-                        finalized = true;
-                    })
-                    .catch((err) => {
-                        this.logger.warn(`Page ${sn}: Failed to wait for selector ${options.waitForSelector}`, { err: marshalErrorLike(err) });
-                        waitForPromise = undefined;
-                    });
-                return p as any;
-            });
-        }
-
-        try {
-            let lastHTML = snapshot?.html;
-            while (true) {
-                const ckpt = [nextSnapshotDeferred.promise, gotoPromise];
-                if (waitForPromise) {
-                    ckpt.push(waitForPromise);
-                }
-                if (options?.minIntervalMs) {
-                    ckpt.push(delay(options.minIntervalMs));
-                }
-                let error;
-                await Promise.race(ckpt).catch((err) => error = err);
-                if (finalized && !error) {
-                    if (!snapshot && !screenshot) {
-                        if (error) {
-                            throw error;
-                        }
-                        throw new AssertionFailureError(`Could not extract any meaningful content from the page`);
+                        lastHTML = snapshot.html;
                     }
-                    yield { ...snapshot, screenshot, pageshot } as PageSnapshot;
-                    break;
+                    if (snapshot || screenshot) {
+                        yield { ...snapshot, screenshot, pageshot } as PageSnapshot;
+                    }
+                    if (error) {
+                        throw error;
+                    }
                 }
-                if (options?.favorScreenshot && snapshot?.title && snapshot?.html !== lastHTML) {
-                    screenshot = await page.screenshot();
-                    pageshot = await page.screenshot({ fullPage: true });
-                    lastHTML = snapshot.html;
-                }
-                if (snapshot || screenshot) {
-                    yield { ...snapshot, screenshot, pageshot } as PageSnapshot;
-                }
-                if (error) {
-                    throw error;
-                }
+            } finally {
+                (waitForPromise ? Promise.allSettled([gotoPromise, waitForPromise]) : gotoPromise).finally(() => {
+                    page.off('snapshot', hdl);
+                    this.ditchPage(page);
+                });
+                nextSnapshotDeferred.resolve();
             }
         } finally {
-            (waitForPromise ? Promise.allSettled([gotoPromise, waitForPromise]) : gotoPromise).finally(() => {
-                page.off('snapshot', hdl);
-                this.ditchPage(page);
-            });
-            nextSnapshotDeferred.resolve();
+            this.timingService.endTiming('puppeteerScrap');
         }
     }
 
@@ -735,6 +773,11 @@ document.addEventListener('load', handlePageLoad);
         })) as PageSnapshot[];
 
         return r.filter(Boolean);
+    }
+
+    private briefPages() {
+        // Log current state of pages using info level instead of debug
+        this.logger.info(`Active pages: ${this.livePages.size}, Idle pages: ${this.__loadedPage.length}`);
     }
 
 }

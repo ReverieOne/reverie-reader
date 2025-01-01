@@ -1,5 +1,8 @@
 # Use the Puppeteer-optimized base image
-FROM ghcr.io/puppeteer/puppeteer:latest
+FROM ghcr.io/puppeteer/puppeteer:22.7.1
+
+# Switch to root for setup
+USER root
 
 # Set working directory
 WORKDIR /app
@@ -17,12 +20,12 @@ COPY backend/functions .
 RUN npm run build
 
 # Create local storage directory and set permissions
-RUN mkdir -p /app/local-storage && chmod 777 /app/local-storage
+RUN mkdir -p /app/local-storage && \
+    mkdir -p /app/build && \
+    chown -R pptruser:pptruser /app && \
+    chmod -R 755 /app
 
-# Create a non-root user for security
-RUN useradd -m pptruser && chown -R pptruser:pptruser /app
-
-# Switch to the non-root user
+# Switch back to pptruser for runtime
 USER pptruser
 
 # Set environment variables

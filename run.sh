@@ -12,5 +12,5 @@ npm install || {
 
 # Run the development server
 echo "Starting development server..."
-export PORT=8075
+export PORT=3050
 npx nodemon --watch ./src --exec "npm run build && node build/server.js"

@@ -8,6 +8,7 @@ import { PuppeteerControl } from './services/puppeteer';
 import { JSDomControl } from './services/jsdom';
 import { FirebaseStorageBucketControl } from './shared';
 import { AsyncContext } from './shared';
+import { TimingService } from './services/timing';
 
 initializeApp();
 
@@ -17,6 +18,7 @@ container.registerSingleton(JSDomControl);
 container.registerSingleton(FirebaseStorageBucketControl);
 container.registerSingleton(AsyncContext);
 container.registerSingleton(CrawlerHost);
+container.registerSingleton(TimingService);
 
 const crawlerHost = container.resolve(CrawlerHost);
 export const crawler = runWith({
