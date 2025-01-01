@@ -285,6 +285,7 @@ export class PuppeteerControl extends AsyncService {
 
             this.activeBrowser = await puppeteer.launch({
                 args: args,
+                headless: true,
                 timeout: 10_000
             }).catch((err: any) => {
                 this.logger.error(`Browser launch failed`, { err });

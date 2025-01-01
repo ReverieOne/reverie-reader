@@ -25,14 +25,22 @@ RUN mkdir -p /app/local-storage && \
     chown -R pptruser:pptruser /app && \
     chmod -R 755 /app
 
-# Switch back to pptruser for runtime
-USER pptruser
+# Install dumb-init for better process handling
+RUN apt-get update && apt-get install -y dumb-init && rm -rf /var/lib/apt/lists/*
 
 # Set environment variables
 ENV PORT=8072
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+
+# Switch back to pptruser for runtime
+USER pptruser
 
 # Expose the port the app runs on
 EXPOSE 8072
 
-# Start the application
+# Use dumb-init as entrypoint
+ENTRYPOINT ["dumb-init", "--"]
+
+# Start the application with the recommended flags
 CMD ["node", "build/server.js"]
