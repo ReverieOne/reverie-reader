@@ -1,46 +1,38 @@
-# Use the Puppeteer-optimized base image
-FROM ghcr.io/puppeteer/puppeteer:22.7.1
+# Use Node base image
+FROM node:18-slim
 
-# Switch to root for setup
-USER root
+# Install required dependencies for Puppeteer and libmagic
+RUN apt-get update && apt-get install -y \
+    chromium \
+    fonts-ipafont-gothic \
+    fonts-wqy-zenhei \
+    fonts-thai-tlwg \
+    fonts-kacst \
+    fonts-symbola \
+    fonts-noto-color-emoji \
+    fonts-freefont-ttf \
+    libmagic-dev \
+    --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Copy package.json and package-lock.json for dependency installation
+# Copy package files
 COPY backend/functions/package*.json ./
 
 # Install dependencies
-RUN npm ci
+RUN npm install
 
 # Copy the rest of the application code
 COPY backend/functions .
 
-# Build the application
-RUN npm run build
-
-# Create local storage directory and set permissions
-RUN mkdir -p /app/local-storage && \
-    mkdir -p /app/build && \
-    chown -R pptruser:pptruser /app && \
-    chmod -R 755 /app
-
-# Install dumb-init for better process handling
-RUN apt-get update && apt-get install -y dumb-init && rm -rf /var/lib/apt/lists/*
-
 # Set environment variables
 ENV PORT=8072
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
-
-# Switch back to pptruser for runtime
-USER pptruser
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Expose the port the app runs on
 EXPOSE 8072
 
-# Use dumb-init as entrypoint
-ENTRYPOINT ["dumb-init", "--"]
-
-# Start the application with the recommended flags
+# Start the application
 CMD ["node", "build/server.js"]

@@ -1,0 +1,8 @@
+version: '3'
+services:
+  puppeteer-service:
+    build: .
+    ports:
+      - "8072:8072"
+    environment:
+      - NODE_ENV=production
